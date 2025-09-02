@@ -1,7 +1,7 @@
 import argparse
 import torch
-from module.env import create_train_env
-from module.model import ActorCritic
+from env_mario.env import create_train_env
+from ppo_mario.networks.model import ActorCritic
 from gym_super_mario_bros.actions import SIMPLE_MOVEMENT, COMPLEX_MOVEMENT, RIGHT_ONLY
 import torch.nn.functional as F
 import time
