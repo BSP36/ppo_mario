@@ -29,8 +29,7 @@ def play(env, actor: nn.Module, device="cuda"):
     done = False
 
     while not done:
-        probs = actor(state)
-        dist = torch.distributions.Categorical(probs=F.softmax(probs, dim=-1))
+        dist = torch.distributions.Categorical(logits=actor(state))
         action = dist.sample()
         state, reward, done, _ = env.step(action.item())
         state = torch.from_numpy(state).float().to(device) # s_{t+1}
@@ -71,16 +70,16 @@ def rollout(
             - actions (Tensor): Actions taken during the rollout.
     """
     device = state.device
-    log_policies, actions, values, states, rewards, dones = [], [], [], [], [], []
+    actor.eval()
+    critic.eval()
     state = state.to(device)
-    # print(state.shape)
-    # exit()
+
+    log_policies, actions, values, states, rewards, dones = [], [], [], [], [], []
     for _ in range(num_local_steps):
-        states.append(state)
-        probs = actor(state)
-        dist = torch.distributions.Categorical(probs=F.softmax(probs, dim=-1))
+        dist = torch.distributions.Categorical(logits=actor(state))
         action = dist.sample()
 
+        states.append(state.cpu())
         actions.append(action.cpu())
         log_policies.append(dist.log_prob(action).cpu())
         values.append(critic(state).cpu())
@@ -114,7 +113,7 @@ def rollout(
     value_states = advantages + torch.cat(values, dim=0).float()
     actions = torch.stack(actions, dim=0)
 
-    return advantages, log_policies, states, value_states, actions
+    return advantages, log_policies, states, value_states, actions, state
 
 
 def train(env, args, device="cuda"):
@@ -136,7 +135,6 @@ def train(env, args, device="cuda"):
     critic = ActorCritic(state_dim, 1, image_size=image_size, base_channels=32, num_repeat=1)
     summary(actor, input_size=(1, state_dim, image_size, image_size))
     # summary(critic, input_size=(1, state_dim, image_size, image_size))
-    # exit()
 
     # Load pre-trained weights if provided
     if args.pre_trained != "":
@@ -157,22 +155,25 @@ def train(env, args, device="cuda"):
 
     with tqdm(range(0, args.num_episode)) as pbar:
         actor_loss, critic_loss = 0.0, 0.0
-        for episode in tqdm(range(0, args.num_episode)):
+        for episode in pbar:
             # Collect rollout/trajectory
-            advantages, log_policies_old, states, value_states, actions = rollout(
+            advantages, log_policies_old, states, value_states, actions, state = rollout(
                 env, actor, critic, state, args.num_local_steps, args.gamma, args.gae_lambda
             )
-            state = state[-1][None, :]
+            # state = states[-1][None, :].to(device)
+            # print(state.shape, state.device)
+            # exit()
 
             # PPO update for several epochs
+            actor.train()
+            critic.train()
             for _ in range(args.num_epochs):
                 indices = torch.randperm(args.num_local_steps)
                 for b in range(args.num_local_steps // args.batch_size):
                     batch_idx = indices[b * args.batch_size:(b + 1) * args.batch_size]
 
                     s = states[batch_idx].to(device)
-                    probs = actor(s)
-                    dist = torch.distributions.Categorical(probs=F.softmax(probs, dim=-1))
+                    dist = torch.distributions.Categorical(logits=actor(s))
                     log_policy = dist.log_prob(actions[batch_idx].squeeze(-1).to(device)).unsqueeze(-1)
 
                     # PPO clipped surrogate loss for actor
@@ -183,7 +184,7 @@ def train(env, args, device="cuda"):
                         args.epsilon
                     )
                     # Encourage exploration via entropy bonus
-                    actor_loss = actor_loss - args.beta * torch.mean(dist.entropy())
+                    actor_loss = actor_loss - args.beta * dist.entropy().mean()
                     optimizer_actor.zero_grad()
                     actor_loss.backward()
                     optimizer_actor.step()

@@ -1,7 +1,7 @@
 import argparse
 import torch
 from env_mario.env import create_train_env
-from ppo_mario.networks.model import ActorCritic
+from networks.model import ActorCritic
 from gym_super_mario_bros.actions import SIMPLE_MOVEMENT, COMPLEX_MOVEMENT, RIGHT_ONLY
 import torch.nn.functional as F
 import time
@@ -17,7 +17,7 @@ def get_args():
     parser.add_argument("--saved_path", type=str, default="checkpoint")
     parser.add_argument("--output_path", type=str, default="output")
     parser.add_argument("--name", type=str, default="best_model")
-    parser.add_argument("--T", type=float, default=0.01)
+    parser.add_argument("--T", type=float, default=5)
     args = parser.parse_args()
     return args
 
@@ -31,7 +31,7 @@ def test(args, device="cpu"):
     else:
         actions = COMPLEX_MOVEMENT
     env = create_train_env(
-        args.world, args.stage, actions,
+        args.world, args.stage, actions, 3, (32, 32), 4,
         f"{args.output_path}/video_{args.world}_{args.stage}.mp4"
         )
     state_dim = env.observation_space.shape[0]
