@@ -1,71 +1,73 @@
+import os
+import time
 import argparse
 import torch
-from env_mario.env import create_train_env
-from networks.model import ActorCritic
-from gym_super_mario_bros.actions import SIMPLE_MOVEMENT, COMPLEX_MOVEMENT, RIGHT_ONLY
 import torch.nn.functional as F
-import time
 from torchinfo import summary
 
+from env_mario.env import MarioEnvironment
+from networks.model import ActorCritic
+from config.args import load_config
 
-def get_args():
-    parser = argparse.ArgumentParser(
-        """Implementation of model described in the paper: Proximal Policy Optimization Algorithms for Contra Nes""")
-    parser.add_argument("--world", type=int, default=1)
-    parser.add_argument("--stage", type=int, default=1)
-    parser.add_argument("--action_type", type=str, default="simple")
-    parser.add_argument("--saved_path", type=str, default="checkpoint")
-    parser.add_argument("--output_path", type=str, default="output")
-    parser.add_argument("--name", type=str, default="best_model")
-    parser.add_argument("--T", type=float, default=5)
-    args = parser.parse_args()
+def parse_args_test():
+    """
+    Parse command-line arguments and load experiment configuration.
+
+    Returns:
+        argparse.Namespace: Parsed arguments with experiment configuration.
+    """
+    parser = argparse.ArgumentParser(description="Test a trained Mario agent.")
+    parser.add_argument("--name", type=str, required=True, help="Experiment name.")
+    parser.add_argument("--ckpt", type=str, default="best_model", help="Checkpoint filename (without extension).")
+    parser.add_argument("--temperature", type=float, default=1.0, help="Softmax temperature for action selection.")
+    args_test = parser.parse_args()
+
+    args = load_config(os.path.join("./experiments", args_test.name, "config.yaml"))
+    args.output = os.path.join("./experiments", args_test.name)
+    args.output_path = os.path.join(args.output, f"play{args.world}-{args.stage}.mp4")
+    args.ckpt = os.path.join(args.output, "checkpoints", f"{args_test.ckpt}.pth")
+    args.temperature = args_test.temperature
     return args
 
-
 def test(args, device="cpu"):
-    torch.manual_seed(123)
-    if args.action_type == "right":
-        actions = RIGHT_ONLY
-    elif args.action_type == "simple":
-        actions = SIMPLE_MOVEMENT
-    else:
-        actions = COMPLEX_MOVEMENT
-    env = create_train_env(
-        args.world, args.stage, actions, 3, (32, 32), 4,
-        f"{args.output_path}/video_{args.world}_{args.stage}.mp4"
-        )
-    state_dim = env.observation_space.shape[0]
-    image_size = env.observation_space.shape[1]
-    model = ActorCritic(
-        state_dim,
-        len(actions),
-        image_size=image_size, base_channels=32, num_repeat=1)
+    """
+    Run the trained Mario agent in the environment and render gameplay.
+
+    Args:
+        args (argparse.Namespace): Experiment configuration and arguments.
+        device (str, optional): Device to run the model on. Defaults to "cpu".
+    """
+    checkpoint = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    env = MarioEnvironment(
+        checkpoint["world"],
+        checkpoint["stage"],
+        checkpoint["action_type"],
+        output_path=args.output_path
+    )
+
+    state_dim = env.num_states
+    image_size = env.width
+
+    # Load model
+    model = ActorCritic(state_dim, env.num_actions, image_size, args.num_repeat, args.base_channels)
     summary(model, input_size=(1, state_dim, image_size, image_size))
-    pth_path = f"{args.saved_path}/{args.name}.pth"
-    checkpoint = torch.load(pth_path, map_location="cpu")
-    print(f'episode: {checkpoint["episode"]}')
     model.load_state_dict(checkpoint["actor_state_dict"])
     model.eval().to(device)
+
+    # Inference loop
     state = torch.from_numpy(env.reset()).to(device)
     while True:
         logits = model(state)
-        # policy = F.softmax(logits, dim=1)
-        # action = torch.argmax(policy).item()
-        dist = torch.distributions.Categorical(probs=F.softmax(logits / args.T, dim=-1))
+        dist = torch.distributions.Categorical(probs=F.softmax(logits / args.temperature, dim=-1))
         action = dist.sample().item()
-        # print(action.shape)
         state, reward, done, info = env.step(action)
-        # print(reward)
-        
         state = torch.from_numpy(state)
-        env.render()
+        env.env.render()
         time.sleep(0.02)
-        # time.sleep(0.5)
-        if info["flag_get"]:
-            print("World {} stage {} completed".format(args.world, args.stage))
+
+        if info.get("flag_get", False):
             break
 
-
 if __name__ == "__main__":
-    args = get_args()
+    args = parse_args_test()
     test(args)

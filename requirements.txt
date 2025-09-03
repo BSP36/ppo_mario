@@ -2,6 +2,7 @@ numpy<2.0
 gym==0.25.2
 gym-super-mario-bros==7.4.0
 torch
+tensorboard
 torchinfo
 timm
 opencv-python<4.9

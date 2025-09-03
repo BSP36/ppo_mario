@@ -78,6 +78,35 @@ class ConvNeXtBlock(nn.Module):
         x = x_skip + self.drop_path(x)
         return x
 
+
+class Downsample(nn.Module):
+    """
+    Downsampling block for ConvNeXt.
+
+    Applies LayerNorm (channels_last) followed by a 2D convolution with stride 2
+    to reduce spatial dimensions and increase channel dimension.
+
+    Args:
+        in_dim (int): Number of input channels.
+        out_dim (int): Number of output channels.
+    """
+    def __init__(self, in_dim: int, out_dim: int):
+        super().__init__()
+        self.norm = LayerNorm(in_dim, eps=1e-6)
+        self.conv = nn.Conv2d(
+            in_dim, out_dim, kernel_size=3, stride=2, padding=1, bias=False
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Convert to channels_last for LayerNorm
+        x = x.permute(0, 2, 3, 1)
+        x = self.norm(x)
+        # Convert back to channels_first for Conv2d
+        x = x.permute(0, 3, 1, 2)
+        x = self.conv(x)
+        return x
+    
+
 class LayerNorm(nn.Module):
     """
     Custom LayerNorm module supporting both 'channels_last' (default) and 'channels_first' data formats.

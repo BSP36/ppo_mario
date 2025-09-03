@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from .block import ConvNeXtBlock
+from .block import ConvNeXtBlock, Downsample, LayerNorm
 
 def clip_loss(
     log_pi_old: torch.Tensor,
@@ -37,54 +37,107 @@ class ActorCritic(nn.Module):
 
     Args:
         in_channels (int): Number of input channels (e.g., 4 for stacked frames).
-        num_outputs (int): Number of output actions (policy logits or value).
+        num_actions (int): Number of output actions (policy logits or value).
         image_size (int): Height/width of the input image (assumed square).
-        num_repeat (int, optional): Number of ConvNeXt blocks per stage. Defaults to 2.
         base_channels (int, optional): Number of channels for the first conv layer. Defaults to 32.
+        num_stages (int, optional): Number of stages in the network. Defaults to 3.
+        num_repeat (int, optional): Number of ConvNeXt blocks per stage. Defaults to 2.
+        
     """
     def __init__(
         self,
         in_channels: int,
-        num_outputs: int,
-        image_size: int,
-        num_repeat: int = 2,
+        num_actions: int,
         base_channels: int = 32,
+        num_stages: int = 3,
+        num_repeat: int = 2,
     ):
         super(ActorCritic, self).__init__()
         self.blocks = nn.ModuleList()
         curr_ch = base_channels
 
         # Initial convolution: downsample input spatially by 4
-        self.blocks.append(
-            nn.Conv2d(in_channels, curr_ch, kernel_size=7, stride=4, padding=3)
-        )
-        image_size = image_size // 4
+        self.stem_norm = LayerNorm(in_channels, eps=1e-6)
+        self.stem = nn.Conv2d(in_channels, curr_ch, kernel_size=4, stride=4, padding=0, bias=False)
 
         # Stacked stages: each halves spatial size and doubles channels
-        for _ in range(3):
-            self.blocks.append(
-                nn.Sequential(
-                    nn.Conv2d(curr_ch, curr_ch * 2, kernel_size=3, stride=2, padding=1),
-                    nn.ReLU(),
-                )
-            )
-            curr_ch *= 2
-            image_size = image_size // 2
-            for _ in range(num_repeat - 1):
+        for l in range(num_stages):
+            for _ in range(num_repeat):
                 self.blocks.append(ConvNeXtBlock(curr_ch, curr_ch))
 
-        # Global average pooling to flatten spatial dimensions
-        self.pooling = nn.AvgPool2d(kernel_size=image_size, stride=1)
+            if l != num_stages - 1:
+                self.blocks.append(Downsample(curr_ch, curr_ch * 2))
+                curr_ch *= 2
 
-        # Fully connected head for output
-        self.head = nn.Sequential(
+        # Global average pooling to flatten spatial dimensions
+        self.pooling = nn.AdaptiveAvgPool2d(1)
+        # Shared pre-head norm
+        self.pre_head_norm = nn.LayerNorm(curr_ch, eps=1e-6)
+        # Actor head
+        self.actor = nn.Sequential(
             nn.Linear(curr_ch, 512),
             nn.GELU(),
-            nn.Linear(512, num_outputs),
+            nn.Linear(512, num_actions),
         )
+        # Critic head
+        self.critic = nn.Sequential(
+            nn.Linear(curr_ch, 512),
+            nn.GELU(),
+            nn.Linear(512, 1),
+        )
+        # Initialize weights for all layers and custom-initialize actor/critic output layers
+        self.apply(self._init_weights)
+        with torch.no_grad():
+            # Scale down the last actor layer weights for stable policy initialization
+            last_actor = self._find_last_linear(self.actor)
+            last_actor.weight.mul_(0.01)
+            if last_actor.bias is not None:
+                last_actor.bias.zero_()
+            # Zero-initialize the last critic layer weights and bias for value head
+            last_critic = self._find_last_linear(self.critic)
+            last_critic.weight.zero_()
+            if last_critic.bias is not None:
+                last_critic.bias.zero_()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _init_weights(m):
+        """Custom weight initialization for Linear and Conv2d layers."""
+        if isinstance(m, nn.Linear):
+            nn.init.orthogonal_(m.weight, gain=1.0)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight, nonlinearity='linear')
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+    @staticmethod
+    def _find_last_linear(module: nn.Module):
+        """Find the last nn.Linear layer in a module."""
+        last = None
+        for m in module.modules():
+            if isinstance(m, nn.Linear):
+                last = m
+        return last
+
+    def forward(self, x: torch.Tensor):
+        """
+        Forward pass for ActorCritic network.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (N, C, H, W).
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: Policy logits and value estimate.
+        """
+        x = x.permute(0, 2, 3, 1)  # (N, C, H, W) -> (N, H, W, C)
+        x = self.stem_norm(x)
+        x = x.permute(0, 3, 1, 2)  # (N, H, W, C) -> (N, C, H, W)
+        x = self.stem(x)
+
         for layer in self.blocks:
             x = layer(x)
+
         x = self.pooling(x).view(x.size(0), -1)
-        return self.head(x)
+        x = self.pre_head_norm(x)
+        return self.actor(x), self.critic(x)

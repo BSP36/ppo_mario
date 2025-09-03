@@ -1,14 +1,12 @@
-"""
-@author: Viet Nguyen <nhviet1009@gmail.com>
-"""
 import cv2
 import numpy as np
 import gym_super_mario_bros
-from nes_py.wrappers import JoypadSpace
 from gym_super_mario_bros.actions import SIMPLE_MOVEMENT, COMPLEX_MOVEMENT, RIGHT_ONLY
+from gym import Wrapper
+from gym.spaces import Box
+from nes_py.wrappers import JoypadSpace
 
-from .reward import CustomReward, CustomSkipFrame
-
+from .reward import CustomReward
 
 class Screen:
     """
@@ -45,39 +43,62 @@ class Screen:
         self.out.release()
 
 
-def create_train_env(
-    world: int,
-    stage: int,
-    actions,
-    num_colors: int,
-    frame_size: tuple,
-    num_skip: int,
-    output_path: str = None
-):
+class CustomSkipFrame(Wrapper):
     """
-    Create and configure a Super Mario Bros training environment with custom reward and frame skipping.
+    Wrapper to skip frames and stack the last N processed frames as a single observation.
+
+    This wrapper executes the same action for a specified number of frames (num_skip),
+    accumulates the rewards, and stacks the resulting frames along the channel dimension.
+    Useful for temporal context in reinforcement learning.
 
     Args:
-        world (int): World number (e.g., 1 for World 1).
-        stage (int): Stage number within the world (e.g., 1 for Stage 1).
-        actions (list): List of allowed action sets (e.g., RIGHT_ONLY, SIMPLE_MOVEMENT, COMPLEX_MOVEMENT).
-        num_colors (int): Number of color channels for the observation (e.g., 1 for grayscale, 3 for RGB).
-        frame_size (tuple): Size to which each frame is resized.
-        num_skip (int): Number of frames to skip (repeat the same action).
-        output_path (str, optional): Path to save gameplay video. If None, video is not recorded.
-
-    Returns:
-        gym.Env: Configured Super Mario Bros environment with custom reward and frame skipping.
+        env (gym.Env): The environment to wrap.
+        num_color (int): Number of color channels in the observation.
+        frame_size (tuple): Size (height, width) to resize frames to.
+        num_skip (int, optional): Number of frames to skip and stack. Defaults to 4.
     """
-    print(f"SuperMarioBros-{world}-{stage}-v3")
-    env = gym_super_mario_bros.make(f"SuperMarioBros-{world}-{stage}-v3")
-    screen = Screen(256, 240, output_path) if output_path else None
+    def __init__(self, env, num_color: int, frame_size: tuple, num_skip: int = 4):
+        super(CustomSkipFrame, self).__init__(env)
+        self.num_skip = num_skip
+        state_shape = (num_skip * num_color, frame_size[0], frame_size[1])
+        self.observation_space = Box(low=0, high=255, shape=state_shape)
+        self.states = np.zeros(state_shape, dtype=np.float32)
 
-    env = JoypadSpace(env, actions)
-    env = CustomReward(env, world, stage, screen)
-    env = CustomSkipFrame(env, num_colors, frame_size, num_skip)
-    return env
+    def step(self, action):
+        """
+        Repeats the given action for num_skip frames, accumulates the reward,
+        and stacks the resulting frames.
 
+        Args:
+            action: The action to perform.
+
+        Returns:
+            tuple: (stacked_states, total_reward, done, info)
+        """
+        total_reward = 0
+        states = []
+        done = False
+        info = None
+        for _ in range(self.num_skip):
+            state, reward, done, info = self.env.step(action)
+            total_reward += reward
+            states.append(state)
+            if done:
+                self.reset()
+                return self.states[None, :, :, :].astype(np.float32), total_reward, done, info
+        self.states = np.concatenate(states, axis=0)
+        return self.states[None, :, :, :].astype(np.float32), total_reward, done, info
+
+    def reset(self):
+        """
+        Resets the environment and stacks the initial frame num_skip times.
+
+        Returns:
+            np.ndarray: The stacked initial observation.
+        """
+        state = self.env.reset()
+        self.states = np.concatenate([state for _ in range(self.num_skip)], axis=0)
+        return self.states[None, :, :, :].astype(np.float32)
 
 class MarioEnvironment:
     """
@@ -90,9 +111,21 @@ class MarioEnvironment:
             - "right": Only right movement actions.
             - "simple": Simple movement actions.
             - "complex": Full set of complex actions.
-        output_path (str, optional): Path to save gameplay video. If None, no video is saved.
+        num_colors (int, optional): Number of color channels for observations (1 for grayscale, 3 for RGB). Defaults to 3.
+        frame_size (int, optional): Size (height and width) to which each frame is resized. Defaults to 32.
+        num_skip (int, optional): Number of frames to skip (repeat the same action). Defaults to 4.
+        output_path (str, optional): Path to save gameplay video. If None, no video is saved. Defaults to None.
     """
-    def __init__(self, world: int, stage: int, action_type: str, output_path: str = None):
+    def __init__(
+            self,
+            world: int,
+            stage: int,
+            action_type: str,
+            num_colors: int = 3,
+            frame_size: int = 32,
+            num_skip: int = 4,
+            output_path: str = None
+        ): 
         # Select action set based on action_type
         if action_type == "right":
             actions = RIGHT_ONLY
@@ -104,15 +137,13 @@ class MarioEnvironment:
             raise NotImplementedError
 
         # Create the Mario environment
-        self.env = create_train_env(
-            world,
-            stage,
-            actions,
-            num_colors=3,
-            frame_size=(32, 32),
-            num_skip=4,
-            output_path=output_path
-        )
+        print(f"SuperMarioBros-{world}-{stage}-v3")
+        env = gym_super_mario_bros.make(f"SuperMarioBros-{world}-{stage}-v3")
+        screen = Screen(256, 240, output_path) if output_path else None
+        env = JoypadSpace(env, actions)
+        env = CustomReward(env, world, stage, screen)
+        self.env = CustomSkipFrame(env, num_colors, (frame_size, frame_size), num_skip)
+
         obs_shape = self.env.observation_space.shape
         self.num_states = obs_shape[0]
         self.height = obs_shape[1]

@@ -2,47 +2,55 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
+from torch.nn.utils import clip_grad_norm_
 from torchinfo import summary
 
 from networks.model import ActorCritic, clip_loss
 
 
 @torch.no_grad()
-def play(env, actor: nn.Module, device="cuda"):
+def play(env, model: nn.Module, gamma: float, device="cuda"):
     """
-    Plays one complete episode using the given actor (policy network) and returns the total reward.
+    Runs a single episode using the current policy and returns both the total and discounted rewards.
 
     Args:
         env: The environment to interact with.
-        actor (nn.Module): The policy network.
+        model (nn.Module): The policy network.
+        gamma (float): Discount factor for computing discounted reward.
         device (str, optional): Device to run the actor on. Defaults to "cuda".
 
     Returns:
-        float: Total reward accumulated during the episode.
+        Tuple[float, float]:
+            - total_reward: Sum of all rewards collected in the episode.
+            - discounted_reward: Sum of discounted rewards using gamma.
     """
-    actor.eval()
-    actor = actor.to(device)
+    model.eval()
+    model = model.to(device)
 
     state = torch.from_numpy(env.reset()[0]).float()[None, :].to(device)
     total_reward = 0.0
+    discounted_reward = 0.0
+    discount = 1.0
     done = False
 
     while not done:
-        dist = torch.distributions.Categorical(logits=actor(state))
+        logits, _ = model(state)
+        dist = torch.distributions.Categorical(logits=logits)
         action = dist.sample()
-        state, reward, done, _ = env.step(action.item())
-        state = torch.from_numpy(state).float().to(device) # s_{t+1}
+        state_np, reward, done, _ = env.step(action.item())
+        state = torch.from_numpy(state_np).float().to(device)
         total_reward += reward
+        discounted_reward += discount * reward
+        discount *= gamma
 
-    return total_reward
+    return total_reward, discounted_reward
 
 
 @torch.no_grad()
 def rollout(
     env,
-    actor: nn.Module,
-    critic: nn.Module,
+    model: nn.Module,
     state: torch.Tensor,
     num_local_steps: int,
     gamma: float,
@@ -54,8 +62,7 @@ def rollout(
 
     Args:
         env: The environment to interact with.
-        actor (nn.Module): The policy network.
-        critic (nn.Module): The value network.
+        model (nn.Module): The policy and value network.
         state (torch.Tensor): Initial state.
         num_local_steps (int): Number of steps to collect in the rollout.
         gamma (float): Discount factor for future rewards.
@@ -70,31 +77,32 @@ def rollout(
             - actions (Tensor): Actions taken during the rollout.
     """
     device = state.device
-    actor.eval()
-    critic.eval()
+    model.eval()
     state = state.to(device)
 
     log_policies, actions, values, states, rewards, dones = [], [], [], [], [], []
     for _ in range(num_local_steps):
-        dist = torch.distributions.Categorical(logits=actor(state))
+        logits, value = model(state)
+        dist = torch.distributions.Categorical(logits=logits)
         action = dist.sample()
 
-        states.append(state.cpu())
-        actions.append(action.cpu())
-        log_policies.append(dist.log_prob(action).cpu())
-        values.append(critic(state).cpu())
+        states.append(state.cpu()) # s_t
+        actions.append(action.cpu()) # a_t ~ \pi(\cdot|s_t)
+        log_policies.append(dist.log_prob(action).cpu()) # \log \pi(a_t|s_t)
+        values.append(value.cpu()) # V(s_t)
 
         # Step environment
         state_np, reward, done, _ = env.step(action.item())
-        state = torch.from_numpy(state_np).float().to(device)
+        state = torch.from_numpy(state_np).float().to(device) # s_{t+1}
 
-        rewards.append(reward)
+        rewards.append(reward) # R(s_t, a_t, s_{t+1})
         dones.append(done)
 
         if done:
             state = torch.from_numpy(env.reset()[0]).float()[None, :].to(device)
 
-    v_next = critic(state).cpu()
+    _, v_next = model(state)
+    v_next = v_next.cpu()
 
     # Compute GAE advantages
     advantages = []
@@ -106,12 +114,15 @@ def rollout(
         v_next = v
 
     # Stack results
-    advantages = torch.cat(advantages, dim=0).float()
-    log_policies = torch.stack(log_policies, dim=0).float()
-    rewards = torch.tensor(rewards)[:, None].float()
-    states = torch.cat(states, dim=0).float()
-    value_states = advantages + torch.cat(values, dim=0).float()
-    actions = torch.stack(actions, dim=0)
+    advantages = torch.cat(advantages, dim=0).float() # [T, 1]
+    log_policies = torch.stack(log_policies, dim=0).float() # [T, 1]
+    rewards = torch.tensor(rewards)[:, None].float() # [T, 1]
+    states = torch.cat(states, dim=0).float() # [T, C, H, W]
+    value_states = advantages + torch.cat(values, dim=0).float() # [T, 1]
+    actions = torch.stack(actions, dim=0) # [T, 1]
+    
+    # normalize advantages for the policy loss only
+    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
     return advantages, log_policies, states, value_states, actions, state
 
@@ -131,87 +142,119 @@ def train(env, args, device="cuda"):
     n_actions = env.num_actions
 
     # Initialize actor and critic networks
-    actor = ActorCritic(state_dim, n_actions, image_size=image_size, base_channels=32, num_repeat=1)
-    critic = ActorCritic(state_dim, 1, image_size=image_size, base_channels=32, num_repeat=1)
-    summary(actor, input_size=(1, state_dim, image_size, image_size))
-    # summary(critic, input_size=(1, state_dim, image_size, image_size))
+    model = ActorCritic(
+        in_channels=state_dim,
+        num_actions=n_actions,
+        base_channels=args.base_channels,
+        num_stages=args.num_stages,
+        num_repeat=args.num_repeat,
+    )
+    summary(model, input_size=(1, state_dim, image_size, image_size))
+    # exit()
 
     # Load pre-trained weights if provided
-    if args.pre_trained != "":
+    if args.pre_trained is not None:
         checkpoint = torch.load(args.pre_trained, map_location="cpu")
-        actor.load_state_dict(checkpoint["actor_state_dict"])
-        critic.load_state_dict(checkpoint["critic_state_dict"])
+        model.load_state_dict(checkpoint["state_dict"])
         start_episode = checkpoint["episode"]
     else:
         start_episode = 0
 
-    actor = actor.to(device)
-    critic = critic.to(device)
-    optimizer_actor = torch.optim.Adam(actor.parameters(), lr=args.lr_actor)
-    optimizer_critic = torch.optim.Adam(critic.parameters(), lr=args.lr_critic)
+    model = model.to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr_actor,
+        weight_decay=args.weight_decay
+    )
+    
+    # Summary writer
+    writer = SummaryWriter(os.path.join(args.output, "runs"))
 
-    # Initialize environment state
-    state = torch.from_numpy(env.reset()[0]).float()[None, :].to(device)
+    # Initialize environment stateprint
+    state = torch.from_numpy(env.reset()).float().to(device) # [1, C, H, W]
+    best_reward = -float('inf')
+    for episode in range(args.num_episode):
+        # Collect rollout/trajectory
+        advantages, log_policies_old, states, value_states, actions, state = rollout(
+            env, model, state, args.num_local_steps, args.gamma, args.gae_lambda
+        )
 
-    with tqdm(range(0, args.num_episode)) as pbar:
-        actor_loss, critic_loss = 0.0, 0.0
-        for episode in pbar:
-            # Collect rollout/trajectory
-            advantages, log_policies_old, states, value_states, actions, state = rollout(
-                env, actor, critic, state, args.num_local_steps, args.gamma, args.gae_lambda
-            )
-            # state = states[-1][None, :].to(device)
-            # print(state.shape, state.device)
-            # exit()
+        # PPO update for several epochs
+        model.train()
+        actor_loss_tot, entropy_loss_tot, critic_loss_tot = 0.0, 0.0, 0.0
+        for _ in range(args.num_epochs):
+            indices = torch.randperm(args.num_local_steps)
+            for b in range(args.num_local_steps // args.batch_size):
+                batch_idx = indices[b * args.batch_size:(b + 1) * args.batch_size]
 
-            # PPO update for several epochs
-            actor.train()
-            critic.train()
-            for _ in range(args.num_epochs):
-                indices = torch.randperm(args.num_local_steps)
-                for b in range(args.num_local_steps // args.batch_size):
-                    batch_idx = indices[b * args.batch_size:(b + 1) * args.batch_size]
+                s = states[batch_idx].to(device)
+                logits, value = model(s)
+                dist = torch.distributions.Categorical(logits=logits)
+                log_policy = dist.log_prob(actions[batch_idx].squeeze(-1).to(device)).unsqueeze(-1)
 
-                    s = states[batch_idx].to(device)
-                    dist = torch.distributions.Categorical(logits=actor(s))
-                    log_policy = dist.log_prob(actions[batch_idx].squeeze(-1).to(device)).unsqueeze(-1)
+                # PPO clipped surrogate loss for actor
+                actor_loss = clip_loss(
+                    log_policies_old[batch_idx].to(device),
+                    log_policy,
+                    advantages[batch_idx].to(device),
+                    args.epsilon
+                )
+                # Encourage exploration via entropy bonus
+                entropy_loss = dist.entropy().mean()
+                actor_loss = actor_loss - args.beta * entropy_loss
+                # Critic loss (value function regression)
+                critic_loss = F.mse_loss(value, value_states[batch_idx].to(device))
 
-                    # PPO clipped surrogate loss for actor
-                    actor_loss = clip_loss(
-                        log_policies_old[batch_idx].to(device),
-                        log_policy,
-                        advantages[batch_idx].to(device),
-                        args.epsilon
-                    )
-                    # Encourage exploration via entropy bonus
-                    actor_loss = actor_loss - args.beta * dist.entropy().mean()
-                    optimizer_actor.zero_grad()
-                    actor_loss.backward()
-                    optimizer_actor.step()
+                loss = actor_loss + 0.5 * critic_loss
+                optimizer.zero_grad()
+                loss.backward()
+                clip_grad_norm_(model.parameters(), max_norm=0.5)
+                optimizer.step()
+                
+                actor_loss_tot += actor_loss.item()
+                entropy_loss_tot += entropy_loss.item()
+                critic_loss_tot += critic_loss.item()
 
-                    # Critic loss (value function regression)
-                    critic_loss = F.mse_loss(critic(s), value_states[batch_idx].to(device))
-                    optimizer_critic.zero_grad()
-                    critic_loss.backward()
-                    optimizer_critic.step()
+        # Evaluate policy after update
+        total_reward, discounted_reward = play(env, model, args.gamma, device=device)
 
-            # Evaluate policy after update
-            tot_r = play(env, actor, device=device)
+        # Output
+        norm = args.num_epochs * (args.num_local_steps // args.batch_size)
+        print(
+            f"[Episode {start_episode + episode + 1}/{args.num_episode}] "
+            f"Actor Loss: {actor_loss_tot / norm:.4f} | "
+            f"Critic Loss: {critic_loss_tot / norm:.4f} | "
+            f"Entropy: {entropy_loss_tot / norm:.4f} | "
+            f"Total Reward: {total_reward:.2f}"
+        )
+        writer.add_scalar('Loss/Actor', actor_loss_tot / norm, episode)
+        writer.add_scalar('Loss/Clip', (actor_loss_tot + args.beta * entropy_loss_tot) / norm, episode)
+        writer.add_scalar('Loss/Entropy', entropy_loss_tot / norm, episode)
+        writer.add_scalar('Loss/Critic', critic_loss_tot /norm, episode)
+        writer.add_scalar('Reward/Total', total_reward, episode)
+        writer.add_scalar('Reward/Discounted', discounted_reward, episode)
 
-            pbar.set_description(
-                f"[EP {start_episode+episode+1}, ALoss {actor_loss:.2f}, CLoss {critic_loss:.2f}, Reward {tot_r:.2f}]"
-            )
-
-            # Save model checkpoint periodically
-            if (episode + 1) % args.save_interval == 0:
-                torch.save({
-                    'episode': start_episode + episode + 1,
-                    'actor_state_dict': actor.state_dict(),
-                    'critic_state_dict': critic.state_dict(),
-                    'world': args.world,
-                    'stage': args.stage,
-                    'action_type': args.action_type,
-                }, os.path.join(args.save_path, f'{start_episode + episode + 1}.pth'))
+        # Save model checkpoint periodically
+        if (episode + 1) % args.save_interval == 0:
+            torch.save({
+                'episode': start_episode + episode + 1,
+                'state_dict': model.state_dict(),
+                'world': args.world,
+                'stage': args.stage,
+                'action_type': args.action_type,
+            }, os.path.join(args.output, "checkpoints", f'{start_episode + episode + 1}.pth'))
+        
+        if best_reward < total_reward:
+            best_reward = total_reward
+            torch.save({
+                'episode': start_episode + episode + 1,
+                'state_dict': model.state_dict(),
+                'world': args.world,
+                'stage': args.stage,
+                'action_type': args.action_type,
+            }, os.path.join(args.output, "checkpoints", f'best_model.pth'))
+    
+    writer.close()
 
 if __name__ == "__main__":
     from config.args import parse_args
