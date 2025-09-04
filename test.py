@@ -3,7 +3,6 @@ import time
 import argparse
 import torch
 import torch.nn.functional as F
-from torchinfo import summary
 
 from env_mario.env import MarioEnvironment
 from networks.model import ActorCritic
@@ -23,9 +22,9 @@ def parse_args_test():
     args_test = parser.parse_args()
 
     args = load_config(os.path.join("./experiments", args_test.name, "config.yaml"))
-    args.output = os.path.join("./experiments", args_test.name)
-    args.output_path = os.path.join(args.output, f"play{args.world}-{args.stage}.mp4")
-    args.ckpt = os.path.join(args.output, "checkpoints", f"{args_test.ckpt}.pth")
+    args.output_root = os.path.join("./experiments", args_test.name)
+    args.video_path = os.path.join(args.output_root, f"play{args.world}-{args.stage}.mp4")
+    args.ckpt = os.path.join(args.output_root, "checkpoints", f"{args_test.ckpt}.pth")
     args.temperature = args_test.temperature
     return args
 
@@ -39,25 +38,34 @@ def test(args, device="cpu"):
     """
     checkpoint = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     env = MarioEnvironment(
-        checkpoint["world"],
-        checkpoint["stage"],
-        checkpoint["action_type"],
-        output_path=args.output_path
+        world=args.world,
+        stage=args.stage,
+        action_type=args.action_type,
+        num_colors=args.num_colors,
+        frame_size=args.frame_size,
+        num_skip=args.num_skip,
+        version=args.version,
+        output_path=args.video_path
     )
 
     state_dim = env.num_states
     image_size = env.width
 
     # Load model
-    model = ActorCritic(state_dim, env.num_actions, image_size, args.num_repeat, args.base_channels)
-    summary(model, input_size=(1, state_dim, image_size, image_size))
-    model.load_state_dict(checkpoint["actor_state_dict"])
+    model = ActorCritic(
+        in_channels=state_dim,
+        num_actions=env.num_actions,
+        base_channels=args.base_channels,
+        num_stages=args.num_stages,
+        num_repeat=args.num_repeat,
+    )
+    model.load_state_dict(checkpoint["state_dict"])
     model.eval().to(device)
 
     # Inference loop
     state = torch.from_numpy(env.reset()).to(device)
     while True:
-        logits = model(state)
+        logits, _ = model(state)
         dist = torch.distributions.Categorical(probs=F.softmax(logits / args.temperature, dim=-1))
         action = dist.sample().item()
         state, reward, done, info = env.step(action)

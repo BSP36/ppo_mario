@@ -6,7 +6,7 @@ from gym import Wrapper
 from gym.spaces import Box
 from nes_py.wrappers import JoypadSpace
 
-from .reward import CustomReward
+from .reward import MarioDenseReward
 
 class Screen:
     """
@@ -100,6 +100,7 @@ class CustomSkipFrame(Wrapper):
         self.states = np.concatenate([state for _ in range(self.num_skip)], axis=0)
         return self.states[None, :, :, :].astype(np.float32)
 
+
 class MarioEnvironment:
     """
     Wrapper class for the Super Mario Bros environment tailored for reinforcement learning.
@@ -114,6 +115,7 @@ class MarioEnvironment:
         num_colors (int, optional): Number of color channels for observations (1 for grayscale, 3 for RGB). Defaults to 3.
         frame_size (int, optional): Size (height and width) to which each frame is resized. Defaults to 32.
         num_skip (int, optional): Number of frames to skip (repeat the same action). Defaults to 4.
+        version (int, optional): Environment version (0, 1, 2, or 3). Defaults to 3.
         output_path (str, optional): Path to save gameplay video. If None, no video is saved. Defaults to None.
     """
     def __init__(
@@ -124,6 +126,7 @@ class MarioEnvironment:
             num_colors: int = 3,
             frame_size: int = 32,
             num_skip: int = 4,
+            version: int = 3,
             output_path: str = None
         ): 
         # Select action set based on action_type
@@ -137,11 +140,18 @@ class MarioEnvironment:
             raise NotImplementedError
 
         # Create the Mario environment
-        print(f"SuperMarioBros-{world}-{stage}-v3")
-        env = gym_super_mario_bros.make(f"SuperMarioBros-{world}-{stage}-v3")
+        print(f"SuperMarioBros-{world}-{stage}-v{version}")
+        env = gym_super_mario_bros.make(f"SuperMarioBros-{world}-{stage}-v{version}")
         screen = Screen(256, 240, output_path) if output_path else None
         env = JoypadSpace(env, actions)
-        env = CustomReward(env, world, stage, screen)
+        env = MarioDenseReward(
+            env=env,
+            world=world,
+            stage=stage,
+            screen=screen,
+            frame_size=(frame_size, frame_size),
+            num_color=num_colors
+        )
         self.env = CustomSkipFrame(env, num_colors, (frame_size, frame_size), num_skip)
 
         obs_shape = self.env.observation_space.shape

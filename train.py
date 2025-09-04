@@ -2,11 +2,12 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.tensorboard import SummaryWriter
 from torch.nn.utils import clip_grad_norm_
+from torch.utils.tensorboard import SummaryWriter
 from torchinfo import summary
 
 from networks.model import ActorCritic, clip_loss
+from utils.lr_scheduler import make_linear_decay_scheduler
 
 
 @torch.no_grad()
@@ -163,17 +164,24 @@ def train(env, args, device="cuda"):
     model = model.to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=args.lr_actor,
+        lr=args.lr,
         weight_decay=args.weight_decay
+    )
+    scheduler = make_linear_decay_scheduler(
+        optimizer,
+        total_updates=args.num_episode,
+        warmup_ratio=0.01,
+        min_lr_ratio=0.1
     )
     
     # Summary writer
-    writer = SummaryWriter(os.path.join(args.output, "runs"))
+    writer = SummaryWriter(os.path.join(args.output_root, "runs"))
 
     # Initialize environment stateprint
     state = torch.from_numpy(env.reset()).float().to(device) # [1, C, H, W]
     best_reward = -float('inf')
     for episode in range(args.num_episode):
+        writer.add_scalar('Learning Rate', scheduler.get_last_lr()[0], episode)
         # Collect rollout/trajectory
         advantages, log_policies_old, states, value_states, actions, state = rollout(
             env, model, state, args.num_local_steps, args.gamma, args.gae_lambda
@@ -215,6 +223,8 @@ def train(env, args, device="cuda"):
                 entropy_loss_tot += entropy_loss.item()
                 critic_loss_tot += critic_loss.item()
 
+        scheduler.step()
+
         # Evaluate policy after update
         total_reward, discounted_reward = play(env, model, args.gamma, device=device)
 
@@ -242,7 +252,7 @@ def train(env, args, device="cuda"):
                 'world': args.world,
                 'stage': args.stage,
                 'action_type': args.action_type,
-            }, os.path.join(args.output, "checkpoints", f'{start_episode + episode + 1}.pth'))
+            }, os.path.join(args.output_root, "checkpoints", f'{start_episode + episode + 1}.pth'))
         
         if best_reward < total_reward:
             best_reward = total_reward
@@ -252,7 +262,7 @@ def train(env, args, device="cuda"):
                 'world': args.world,
                 'stage': args.stage,
                 'action_type': args.action_type,
-            }, os.path.join(args.output, "checkpoints", f'best_model.pth'))
+            }, os.path.join(args.output_root, "checkpoints", f'best_model.pth'))
     
     writer.close()
 
@@ -261,7 +271,16 @@ if __name__ == "__main__":
     from env_mario.env import MarioEnvironment
 
     args = parse_args()
-    env = MarioEnvironment(args.world, args.stage, args.action_type)
-    train(env, args, device="mps")
+    env = MarioEnvironment(
+        world=args.world,
+        stage=args.stage,
+        action_type=args.action_type,
+        num_colors=args.num_colors,
+        frame_size=args.frame_size,
+        num_skip=args.num_skip,
+        version=args.version,
+        output_path=None
+    )
+    train(env, args, device=args.device)
 
     
