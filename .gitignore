@@ -1,3 +1,7 @@
 __pycache__/
 experiments/
 myenv/
+.DS_Store
+*.pyc
+*.pyo
+*.pyd
