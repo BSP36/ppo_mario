@@ -37,11 +37,13 @@ def parse_args():
                         help='Number of times to repeat ConvNeXt blocks.')
 
     # Training parameters
-    parser.add_argument('--batch_size', type=int, default=64,
+    parser.add_argument('--num_envs', type=int, default=8,
+                        help='Number of parallel environment instances.')
+    parser.add_argument('--batch_size', type=int, default=256,
                         help='Batch size for training.')
     parser.add_argument('--num_epochs', type=int, default=4,
                         help='Number of epochs per update.')
-    parser.add_argument('--num_local_steps', type=int, default=256,
+    parser.add_argument('--num_local_steps', type=int, default=128,
                         help='Number of steps to run per environment per update.')
     parser.add_argument('--save_interval', type=int, default=100,
                         help='Number of steps between saving checkpoints.')
@@ -55,8 +57,8 @@ def parse_args():
     # Output and environment settings
     parser.add_argument('--name', type=str, default="test1-1",
                         help='Experiment name for saving outputs.')
-    parser.add_argument('--num_episode', type=int, default=1000,
-                        help='Number of episodes to run.')
+    parser.add_argument('--num_ppo_updates', type=int, default=5000,
+                        help='Total number of PPO updates to perform.')
 
     # Super Mario Bros environment configuration
     parser.add_argument('--version', type=int, default=3,
@@ -86,8 +88,8 @@ def parse_args():
     assert args.num_colors in [1, 3], "num_colors must be 1 (grayscale) or 3 (RGB)."
 
     # Sanity check: batch size must divide local steps
-    assert args.num_local_steps % args.batch_size == 0, \
-        "num_local_steps must be divisible by batch_size."
+    assert (args.num_local_steps * args.num_envs) % args.batch_size == 0, \
+        "Batch size must divide (num_local_steps * num_envs)."
 
     # Save args as YAML
     with open(os.path.join(args.output_root, "config.yaml"), "w") as f:

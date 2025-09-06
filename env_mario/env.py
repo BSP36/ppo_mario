@@ -1,5 +1,7 @@
 import cv2
 import numpy as np
+import gym
+from gym import spaces
 import gym_super_mario_bros
 from gym_super_mario_bros.actions import SIMPLE_MOVEMENT, COMPLEX_MOVEMENT, RIGHT_ONLY
 from gym import Wrapper
@@ -99,9 +101,9 @@ class CustomSkipFrame(Wrapper):
         state = self.env.reset()
         self.states = np.concatenate([state for _ in range(self.num_skip)], axis=0)
         return self.states[None, :, :, :].astype(np.float32)
+    
 
-
-class MarioEnvironment:
+class MarioEnvironment(gym.Env):
     """
     Wrapper class for the Super Mario Bros environment tailored for reinforcement learning.
 
@@ -117,19 +119,21 @@ class MarioEnvironment:
         num_skip (int, optional): Number of frames to skip (repeat the same action). Defaults to 4.
         version (int, optional): Environment version (0, 1, 2, or 3). Defaults to 3.
         output_path (str, optional): Path to save gameplay video. If None, no video is saved. Defaults to None.
+        seed (int, optional): Random seed for the environment. Defaults to None.
     """
+    # metadata = {"render.modes": ["human"]}
     def __init__(
-            self,
-            world: int,
-            stage: int,
-            action_type: str,
-            num_colors: int = 3,
-            frame_size: int = 32,
-            num_skip: int = 4,
-            version: int = 3,
-            output_path: str = None
-        ): 
-        # Select action set based on action_type
+        self,
+        world: int,
+        stage: int,
+        action_type: str,
+        num_colors: int = 3,
+        frame_size: int = 32,
+        num_skip: int = 4,
+        version: int = 3,
+        output_path: str = None,
+        seed: int | None = None,
+    ):
         if action_type == "right":
             actions = RIGHT_ONLY
         elif action_type == "simple":
@@ -139,10 +143,9 @@ class MarioEnvironment:
         else:
             raise NotImplementedError
 
-        # Create the Mario environment
-        print(f"SuperMarioBros-{world}-{stage}-v{version}")
         env = gym_super_mario_bros.make(f"SuperMarioBros-{world}-{stage}-v{version}")
         screen = Screen(256, 240, output_path) if output_path else None
+
         env = JoypadSpace(env, actions)
         env = MarioDenseReward(
             env=env,
@@ -150,15 +153,27 @@ class MarioEnvironment:
             stage=stage,
             screen=screen,
             frame_size=(frame_size, frame_size),
-            num_color=num_colors
+            num_color=num_colors,
         )
         self.env = CustomSkipFrame(env, num_colors, (frame_size, frame_size), num_skip)
 
-        obs_shape = self.env.observation_space.shape
+        self.observation_space: spaces.Space = self.env.observation_space
+        self.action_space: spaces.Space = self.env.action_space
+
+        obs_shape = self.observation_space.shape  # (C, H, W)
         self.num_states = obs_shape[0]
         self.height = obs_shape[1]
         self.width = obs_shape[2]
-        self.num_actions = len(actions)
+        self.num_actions = self.action_space.n
+        
+        if seed is not None:
+            self.seed(seed)
+
+    def seed(self, seed=None):
+        try:
+            self.env.seed(seed)
+        except Exception:
+            pass
 
     def step(self, action):
         """

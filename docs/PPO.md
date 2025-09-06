@@ -1,4 +1,8 @@
 # Proximal Policy Optimization
+> ⚠️ Note: This document contains several mathematical equations.  
+> GitHub’s Markdown renderer may not display them correctly.  
+> For proper formatting, please open this file in a local Markdown viewer (e.g., VS Code) or a LaTeX-compatible editor.
+
 - PPO: https://arxiv.org/pdf/1707.06347
 - TRPO: https://arxiv.org/pdf/1502.05477
 - A2C: https://arxiv.org/pdf/1602.01783

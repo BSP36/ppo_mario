@@ -48,12 +48,9 @@ def test(args, device="cpu"):
         output_path=args.video_path
     )
 
-    state_dim = env.num_states
-    image_size = env.width
-
     # Load model
     model = ActorCritic(
-        in_channels=state_dim,
+        in_channels=env.num_states,
         num_actions=env.num_actions,
         base_channels=args.base_channels,
         num_stages=args.num_stages,
