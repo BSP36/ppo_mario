@@ -10,44 +10,6 @@ from torchinfo import summary
 from networks.model import ActorCritic, clip_loss
 from utils.lr_scheduler import make_linear_decay_scheduler
 
-@torch.no_grad()
-def evaluate_policy(env, model: nn.Module, gamma: float, device="cuda"):
-    """
-    Runs a single episode in the environment using the current policy in evaluation mode.
-    At each step, the agent selects the greedy (highest probability) action.
-    Returns both the total reward and the discounted reward accumulated over the episode.
-
-    Args:
-        env: The environment to interact with.
-        model (nn.Module): The policy network.
-        gamma (float): Discount factor for computing discounted reward.
-        device (str, optional): Device to run the actor on. Defaults to "cuda".
-
-    Returns:
-        Tuple[float, float]:
-            - total_reward: Sum of all rewards collected in the episode.
-            - discounted_reward: Sum of discounted rewards using gamma.
-    """
-    model.eval()
-    model = model.to(device)
-
-    state = torch.from_numpy(env.reset()).float().to(device)
-    total_reward = 0.0
-    discounted_reward = 0.0
-    discount = 1.0
-    done = False
-
-    while not done:
-        logits, _ = model(state)
-        action = torch.argmax(logits, dim=-1)  # Select greedy action
-        state_np, reward, done, _ = env.step(action.item())
-        state = torch.from_numpy(state_np).float().to(device)
-        total_reward += reward
-        discounted_reward += discount * reward
-        discount *= gamma
-
-    return total_reward, discounted_reward
-
 
 @torch.no_grad()
 def rollout(
@@ -125,23 +87,22 @@ def rollout(
     # normalize advantages for the policy loss only
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-    return advantages, log_policies, states, value_states, actions, state
+    return advantages, log_policies, states, value_states, actions, rewards, state
 
 
-def train(train_env, val_env, args, device="cuda"):
+def train(env, args, device="cuda"):
     """
     Trains the Actor-Critic model using Proximal Policy Optimization (PPO).
 
     Args:
-        train_env: The training environment.
-        val_env: The validation environment.
+        env: The vectorized environment for training.
         args: Arguments containing hyperparameters and settings.
         device (str, optional): Device to run the training on. Defaults to "cuda".
     """
     # Define model dimensions
-    state_dim = val_env.num_states
+    state_dim = env.get_attr("num_states")[0]
     image_size = args.frame_size
-    n_actions = val_env.num_actions
+    n_actions = env.get_attr("num_actions")[0]
 
     # Initialize actor and critic networks
     model = ActorCritic(
@@ -178,15 +139,17 @@ def train(train_env, val_env, args, device="cuda"):
     writer = SummaryWriter(os.path.join(args.output_root, "runs"))
 
     # Initialize environment stateprint
-    state = torch.from_numpy(train_env.reset()).float().to(device) # [N, C, H, W]
+    state = torch.from_numpy(env.reset()).float().to(device) # [N, C, H, W]
     
     best_reward = -float('inf')
     for update in range(args.num_ppo_updates):
-        writer.add_scalar('Learning Rate', scheduler.get_last_lr()[0], update)
         # Collect rollout/trajectory
-        advantages, log_policies_old, states, value_states, actions, state = rollout(
-            train_env, model, state, args.num_local_steps, args.gamma, args.gae_lambda
+        advantages, log_policies_old, states, value_states, actions, rewards, state = rollout(
+            env, model, state, args.num_local_steps, args.gamma, args.gae_lambda
         )
+        average_reward = rewards.mean().item()
+        writer.add_scalar('Learning Rate', scheduler.get_last_lr()[0], update)
+        writer.add_scalar('Average Reward', average_reward, update)
 
         # PPO update for several epochs
         model.train()
@@ -227,24 +190,13 @@ def train(train_env, val_env, args, device="cuda"):
 
         scheduler.step()
 
-        # Evaluate policy after update
-        total_reward, discounted_reward = evaluate_policy(val_env, model, args.gamma, device=device)
-
         # Output
         norm = args.num_epochs * (num_samples // args.batch_size)
-        print(
-            f"[Update {start_update + update + 1}/{args.num_ppo_updates}] "
-            f"Actor Loss: {actor_loss_tot / norm:.4f} | "
-            f"Critic Loss: {critic_loss_tot / norm:.4f} | "
-            f"Entropy: {entropy_loss_tot / norm:.4f} | "
-            f"Total Reward: {total_reward:.2f}"
-        )
+        
         writer.add_scalar('Loss/Actor', actor_loss_tot / norm, update)
         writer.add_scalar('Loss/Clip', (actor_loss_tot + args.beta * entropy_loss_tot) / norm, update)
         writer.add_scalar('Loss/Entropy', entropy_loss_tot / norm, update)
         writer.add_scalar('Loss/Critic', critic_loss_tot /norm, update)
-        writer.add_scalar('Reward/Total', total_reward, update)
-        writer.add_scalar('Reward/Discounted', discounted_reward, update)
 
         # Save model checkpoint periodically
         if (update + 1) % args.save_interval == 0:
@@ -256,8 +208,9 @@ def train(train_env, val_env, args, device="cuda"):
                 'action_type': args.action_type,
             }, os.path.join(args.output_root, "checkpoints", f'{start_update + update + 1}.pth'))
         
-        if best_reward < total_reward:
-            best_reward = total_reward
+        log_best_model = ""
+        if best_reward < average_reward:
+            best_reward = average_reward
             torch.save({
                 'update': start_update + update + 1,
                 'state_dict': model.state_dict(),
@@ -265,16 +218,24 @@ def train(train_env, val_env, args, device="cuda"):
                 'stage': args.stage,
                 'action_type': args.action_type,
             }, os.path.join(args.output_root, "checkpoints", f'best_model.pth'))
+            log_best_model = " | best_model is updated!"
+        
+        print(
+            f"[Update {start_update + update + 1}/{args.num_ppo_updates}] "
+            f"Actor Loss: {actor_loss_tot / norm:.4f} | "
+            f"Critic Loss: {critic_loss_tot / norm:.4f} | "
+            f"Entropy: {entropy_loss_tot / norm:.4f} | "
+            f"Average Reward: {average_reward:.2f}{log_best_model}"
+        )
     
     writer.close()
 
 if __name__ == "__main__":
     from config.args import parse_args
-    from env_mario.env import MarioEnvironment
     from env_mario.vec_env import build_vec_env
 
     args = parse_args()
-    train_env = build_vec_env(
+    env = build_vec_env(
         num_envs=args.num_envs,
         world=args.world,
         stage=args.stage,
@@ -286,16 +247,7 @@ if __name__ == "__main__":
         output_path=None,
         base_seed=0
     )
-    val_env = MarioEnvironment(
-        world=args.world,
-        stage=args.stage,
-        action_type=args.action_type,
-        num_colors=args.num_colors,
-        frame_size=args.frame_size,
-        num_skip=args.num_skip,
-        version=args.version,
-        output_path=None,
-    )
-    train(train_env, val_env, args, device=args.device)
+
+    train(env, args, device=args.device)
 
     
