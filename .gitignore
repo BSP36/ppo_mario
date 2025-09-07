@@ -1,5 +1,7 @@
 __pycache__/
 experiments/
+!experiments/test1-1/
+!experiments/test1-1/**
 myenv/
 .DS_Store
 *.pyc

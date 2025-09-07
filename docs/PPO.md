@@ -304,7 +304,7 @@ This condition is satisfied by drawing $(s, a)$ uniformly at random from the set
 (The treatment of $\hat{A}_t$ will be discussed shortly.)
 
 
-Following Schulman et al. (2015, 2017), the surrogate objective in TRPO and PPO omits explicit $\gamma^t$ weighting and uses uniform timestep sampling as a practical variance-reduction technique, since the advantage function already accounts for discounting and the empirical state distribution approximates the discounted visitation distribution (see, e.g., [arXiv:2306.13284](https://arxiv.org/pdf/2306.13284)).
+Following Schulman et al. (2015, 2017), the surrogate objective in TRPO and PPO omits explicit $\gamma^t$ weighting and uses uniform timestep sampling as a practical variance-reduction technique (see, e.g., [arXiv:2306.13284](https://arxiv.org/pdf/2306.13284)).
 Adopting this convention, we will simply set
 $\hat{A}_t = A_{\pi_{\theta_{\mathrm{old}}}}$.
 
