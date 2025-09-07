@@ -3,7 +3,7 @@
 This repository provides an implementation of **Proximal Policy Optimization (PPO)** applied to the classic *Super Mario Bros* environments.
 It enables training and evaluating reinforcement learning agents that learn to play Mario using PyTorch.
 
-<video src="assets/play1-1.mp4" width="256" height="240" controls></video>
+![PPO Mario 1-1 Demo](assets/play1-1.gif)
 
 📖 For a brief introduction to PPO, see [docs/PPO.md](./docs/PPO.md).
 
